@@ -92,7 +92,7 @@ class TransactionHistory(BaseModel):
     transaction_id: str = Field(..., description="Unique transaction ID")
     timestamp: str = Field(..., description="ISO 8601 transaction timestamp")
     type: TransactionType = Field(..., description="Type of transaction")
-    amount: float = Field(default=None, ge=0, description="Transaction amount in BDT")
+    amount: float = Field(default=None, gt=0, description="Transaction amount in BDT")
     counterparty: str = Field(
         ..., description="Phone number, merchant ID, or agent ID"
     )
