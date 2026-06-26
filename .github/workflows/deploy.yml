@@ -1,0 +1,108 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      # Make the package public so EC2 can pull without credentials.
+      - name: Make package public
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          PACKAGE=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+          curl -sf -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/user/packages/container/${PACKAGE}/versions" \
+            || echo "Note: Set package visibility to public manually in GitHub if this step fails."
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Copy docker-compose.yml to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "docker-compose.yml"
+          target: "/home/${{ secrets.EC2_USERNAME }}/support-copilot-api"
+          overwrite: true
+
+      - name: Write .env and run docker compose on EC2
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            APP_DIR="/home/${{ secrets.EC2_USERNAME }}/support-copilot-api"
+            cd "$APP_DIR"
+
+            # Write .env from GitHub Secrets (overwritten on every deploy)
+            # GITHUB_REPOSITORY must be lowercase for Docker image references
+            REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+            cat > .env <<EOF
+            OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}
+            GITHUB_REPOSITORY=${REPO}
+            EOF
+
+            echo "▶ Pulling latest image..."
+            docker compose pull
+
+            echo "▶ Restarting service..."
+            docker compose up -d --remove-orphans
+
+            echo "▶ Waiting for health check..."
+            sleep 8
+            curl -sf http://localhost:80/health && echo " ✅ Healthy" || echo " ⚠️  Health check failed"
