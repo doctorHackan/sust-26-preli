@@ -1,4 +1,18 @@
-# 🤖 Support Copilot API
+# Team ssh_429
+
+live deployment base url(https): https://api.ssh429.dpdns.org/ \
+health-check: https://api.ssh429.dpdns.org/health
+
+backup http base url: http://98.92.226.43/ \
+health-check: http://98.92.226.43/health
+
+> Note: We are using openrouter API key for gpt-oss-120b:free.
+> This comes with a limit of 50 requests per day. But we have a fallback system which uses rule-based checking.  
+
+## MODELS
+1. gpt-oss-120b:free
+
+## 🤖 Support Copilot API
 
 AI-powered Support Copilot that investigates customer complaints, cross-references transaction history, and routes cases to the appropriate department — with safe, compliant customer replies.
 
@@ -228,17 +242,37 @@ curl -s -X POST http://localhost:8000/analyze-ticket \
 
 ## 🔄 Analysis Flow
 
-```
-Request → Validate (Pydantic)
-  │
-  ├─ API Key configured?
-  │   ├─ Yes → Try LLM Analysis (OpenRouter)
-  │   │         ├─ Success → Safety Check → Response
-  │   │         └─ Failure → Rule-Based Fallback ↓
-  │   └─ No  → Rule-Based Fallback ↓
-  │
-  └─ Rule-Based Analysis
-       └─ Keyword matching → Department routing → Safety Check → Response
+```mermaid
+graph TD
+    Client((Client Application)) -->|POST /analyze-ticket| API[FastAPI Application]
+    
+    subgraph Core Architecture
+        API -->|1. Request Validation| Pydantic[Pydantic Models]
+        
+        Pydantic -->|Valid Request| Decision{OpenRouter<br/>Configured?}
+        
+        Decision -->|Yes| LLM[LLM Service<br/>openai/gpt-oss-120b]
+        Decision -->|No / Error / Timeout| Fallback[Rule-Based Fallback<br/>Keyword Matching & Heuristics]
+        
+        LLM -->|Cross-reference & classify| LLM_Report[Draft Investigation Report]
+        Fallback -->|Deterministic matching| Fallback_Report[Draft Investigation Report]
+        
+        LLM_Report --> Safety[Safety Guardrails<br/>Regex Post-Processor]
+        Fallback_Report --> Safety
+        
+        Safety -->|Scrub Credentials &<br/>Remove Refund Promises| Final[Final Safe TicketResponse]
+    end
+    
+    Final -->|200 OK Response| Client
+    Pydantic -.->|Invalid Schema| Error[422 Unprocessable Entity] -.-> Client
+    
+    classDef main fill:#f9f,stroke:#333,stroke-width:2px;
+    classDef ai fill:#bbf,stroke:#333,stroke-width:2px;
+    classDef safety fill:#bfb,stroke:#333,stroke-width:2px;
+    
+    class API main;
+    class LLM ai;
+    class Safety safety;
 ```
 
 ---
@@ -266,7 +300,7 @@ The GitHub Actions workflow (`.github/workflows/deploy.yml`) automates:
 | Secret | Description |
 |--------|-------------|
 | `EC2_HOST` | EC2 instance public IP or hostname |
-| `EC2_USERNAME` | SSH username (e.g., `ubuntu`) |
+| `EC2_USERNAME` | SSH username (e.g., `ec2-user`) |
 | `EC2_SSH_KEY` | Private SSH key for EC2 access |
 | `OPENROUTER_API_KEY` | OpenRouter API key |
 
