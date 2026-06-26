@@ -30,7 +30,7 @@ Your job is to analyze a customer support ticket along with their recent transac
 
 ## INVESTIGATION PROCESS
 1. Read the customer complaint carefully.
-2. Cross-reference the complaint against the provided transaction history.
+2. Cross-reference the complaint against the provided full transaction history.
 3. Determine if the transaction history SUPPORTS, CONTRADICTS, or is INSUFFICIENT to evaluate the complaint.
 4. Classify the complaint, assign severity, route to the correct department.
 5. Draft a safe customer reply and recommended next action for the agent.
@@ -108,6 +108,8 @@ You MUST respond with ONLY a valid JSON object matching this exact schema (no ma
 - Set human_review_required to true for high/critical severity cases.
 - Be conservative with confidence scores. Use lower scores when evidence is unclear.
 - reason_codes should include the case_type and any relevant supporting labels (e.g., "transaction_match", "amount_mismatch", "no_transaction_found").
+- For "wrong_transfer" claims, carefully review the transaction history for an established pattern. If there are multiple prior transfers to the same counterparty, the claim of sending it "by mistake" is contradicted. In such cases, set evidence_verdict to "inconsistent", flag human_review_required to true, and explain this inconsistency in the agent_summary.
+- Set human_review_required to true for high/critical severity cases, or when evidence is inconsistent.
 """
 
 
