@@ -243,7 +243,7 @@ _CUSTOMER_REPLIES: dict[CaseType, str] = {
 }
 
 
-# ── Classification ───────────────────────────────────────────────────────────
+# ── Classification & Extraction ──────────────────────────────────────────────
 
 
 def _classify_case_type(complaint: str) -> CaseType:
@@ -256,68 +256,107 @@ def _classify_case_type(complaint: str) -> CaseType:
     return CaseType.OTHER
 
 
-# ── Transaction Matching ─────────────────────────────────────────────────────
+def _extract_amounts_from_text(text: str) -> list[float]:
+    """Extract potential monetary amounts from the complaint text."""
+    # Matches formats like 5000, 5,000, 5000.00
+    matches = re.findall(r'\b\d+(?:,\d{3})*(?:\.\d+)?\b', text)
+    amounts = []
+    for m in matches:
+        try:
+            amounts.append(float(m.replace(',', '')))
+        except ValueError:
+            pass
+    return amounts
 
 
-def _find_relevant_transaction(
+# ── Transaction Matching & Evidence Evaluation ───────────────────────────────
+
+
+def _evaluate_evidence(
+    complaint: str,
     case_type: CaseType,
     transactions: Optional[List[TransactionHistory]],
-) -> Optional[str]:
-    """Find the most relevant transaction ID for the given case type."""
+) -> Tuple[Optional[str], EvidenceVerdict]:
+    """
+    Find the relevant transaction and verify if the data actually supports the complaint.
+    Returns (relevant_transaction_id, evidence_verdict).
+    """
     if not transactions:
-        return None
+        return None, EvidenceVerdict.INSUFFICIENT_DATA
+
+    candidate_id = None
+    verdict = EvidenceVerdict.INCONSISTENT
+    claimed_amounts = _extract_amounts_from_text(complaint)
+
+    def _amount_matches(txn: TransactionHistory) -> bool:
+        """Check if the transaction amount was mentioned in the user's text."""
+        if not claimed_amounts:
+            return True  # If the user didn't mention an amount, we assume it's consistent.
+        return float(txn.amount) in claimed_amounts
 
     if case_type == CaseType.WRONG_TRANSFER:
         for txn in transactions:
             if txn.type.value == "transfer" and txn.status.value == "completed":
-                return txn.transaction_id
+                candidate_id = txn.transaction_id
+                if _amount_matches(txn):
+                    verdict = EvidenceVerdict.CONSISTENT
+                    break
 
     elif case_type == CaseType.PAYMENT_FAILED:
         for txn in transactions:
-            if txn.status.value in ("failed", "pending"):
-                return txn.transaction_id
-        # Also check completed where balance might have been deducted
-        for txn in transactions:
-            if txn.type.value == "payment":
-                return txn.transaction_id
+            if txn.type.value == "payment" or txn.status.value in ("failed", "pending"):
+                candidate_id = txn.transaction_id
+                if _amount_matches(txn):
+                    verdict = EvidenceVerdict.CONSISTENT
+                    break
 
     elif case_type == CaseType.DUPLICATE_PAYMENT:
-        amounts = Counter(txn.amount for txn in transactions)
+        # For duplicates, we need to find two identical amounts
+        amounts = Counter(float(txn.amount) for txn in transactions)
+        duplicate_found = False
         for amount, count in amounts.items():
             if count >= 2:
-                for txn in transactions:
-                    if txn.amount == amount:
-                        return txn.transaction_id
+                # Get the duplicate transactions
+                dupes = [t for t in transactions if float(t.amount) == amount]
+                if len(dupes) >= 2:
+                    candidate_id = dupes[1].transaction_id  # The 2nd one is the duplicate
+                    if not claimed_amounts or amount in claimed_amounts:
+                        verdict = EvidenceVerdict.CONSISTENT
+                        duplicate_found = True
+                        break
+        # If no strict duplicate found but transactions exist, pick the first as fallback (inconsistent)
+        if not duplicate_found and transactions:
+            candidate_id = transactions[0].transaction_id
 
     elif case_type == CaseType.REFUND_REQUEST:
         for txn in transactions:
             if txn.status.value == "completed":
-                return txn.transaction_id
+                candidate_id = txn.transaction_id
+                if _amount_matches(txn):
+                    verdict = EvidenceVerdict.CONSISTENT
+                    break
 
     elif case_type == CaseType.MERCHANT_SETTLEMENT_DELAY:
         for txn in transactions:
             if txn.type.value == "settlement":
-                return txn.transaction_id
+                candidate_id = txn.transaction_id
+                if _amount_matches(txn):
+                    verdict = EvidenceVerdict.CONSISTENT
+                    break
 
     elif case_type == CaseType.AGENT_CASH_IN_ISSUE:
         for txn in transactions:
             if txn.type.value == "cash_in":
-                return txn.transaction_id
+                candidate_id = txn.transaction_id
+                if _amount_matches(txn):
+                    verdict = EvidenceVerdict.CONSISTENT
+                    break
 
-    # Fallback: return first transaction
-    return transactions[0].transaction_id if transactions else None
+    # Final Fallback: If no specific logic matched, grab the first transaction but leave it INCONSISTENT
+    if not candidate_id and transactions:
+        candidate_id = transactions[0].transaction_id
 
-
-def _determine_verdict(
-    transactions: Optional[List[TransactionHistory]],
-    relevant_txn_id: Optional[str],
-) -> EvidenceVerdict:
-    """Determine evidence verdict based on transaction matching."""
-    if not transactions:
-        return EvidenceVerdict.INSUFFICIENT_DATA
-    if relevant_txn_id:
-        return EvidenceVerdict.CONSISTENT
-    return EvidenceVerdict.INCONSISTENT
+    return candidate_id, verdict
 
 
 # ── Public Entry Point ───────────────────────────────────────────────────────
@@ -333,10 +372,10 @@ def analyze_ticket_rule_based(request: TicketRequest) -> TicketResponse:
     department = _CASE_TO_DEPARTMENT[case_type]
     severity = _CASE_TO_SEVERITY[case_type]
 
-    relevant_txn_id = _find_relevant_transaction(
-        case_type, request.transaction_history
+    # Use the new unified evidence evaluation
+    relevant_txn_id, verdict = _evaluate_evidence(
+        request.complaint, case_type, request.transaction_history
     )
-    verdict = _determine_verdict(request.transaction_history, relevant_txn_id)
 
     # Build evidence description for the summary
     if verdict == EvidenceVerdict.CONSISTENT:
@@ -344,9 +383,12 @@ def analyze_ticket_rule_based(request: TicketRequest) -> TicketResponse:
             f"Transaction {relevant_txn_id} in the history supports this report"
         )
     elif verdict == EvidenceVerdict.INCONSISTENT:
-        evidence_info = (
-            "Transaction history does not clearly support the reported issue"
-        )
+        if relevant_txn_id:
+            evidence_info = (
+                f"Transaction history (e.g., {relevant_txn_id}) contradicts the details reported by the customer"
+            )
+        else:
+            evidence_info = "Transaction history does not match the reported issue"
     else:
         evidence_info = "No transaction history was provided for verification"
 
@@ -363,13 +405,14 @@ def analyze_ticket_rule_based(request: TicketRequest) -> TicketResponse:
     if verdict == EvidenceVerdict.INSUFFICIENT_DATA:
         reason_codes.append("no_transaction_data")
 
-    human_review = severity in (Severity.HIGH, Severity.CRITICAL)
+    human_review = severity in (Severity.HIGH, Severity.CRITICAL) or verdict == EvidenceVerdict.INCONSISTENT
 
     logger.info(
-        "Rule-based analysis for ticket %s: case_type=%s, severity=%s",
+        "Rule-based analysis for ticket %s: case_type=%s, severity=%s, verdict=%s",
         request.ticket_id,
         case_type.value,
         severity.value,
+        verdict.value,
     )
 
     return TicketResponse(
@@ -383,6 +426,6 @@ def analyze_ticket_rule_based(request: TicketRequest) -> TicketResponse:
         recommended_next_action=_NEXT_ACTIONS[case_type],
         customer_reply=_CUSTOMER_REPLIES[case_type],
         human_review_required=human_review,
-        confidence=0.60,
+        confidence=0.60, # Keep confidence modest for fallback logic
         reason_codes=reason_codes,
     )
